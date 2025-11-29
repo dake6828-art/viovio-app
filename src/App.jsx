@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Search, Book, Volume2, X, Trash2, Star, Zap, AlertCircle, Monitor, Loader2, LogIn, Mail, Lock, User, SkipForward, RefreshCw, Type, Shuffle, Sparkles, Eye, EyeOff, Cat } from 'lucide-react';
+import { Search, Book, Volume2, X, Trash2, Star, Zap, AlertCircle, Monitor, Loader2, LogIn, Mail, Lock, User, SkipForward, RefreshCw, Type, Shuffle, Sparkles, Eye, EyeOff, Cat, CheckCircle } from 'lucide-react';
 
 // --- Global Configuration ---
-const apiKey = import.meta.env.VITE_GEMINI_API_KEY;; // API key is automatically injected at runtime
+const apiKey = ""; // API key is automatically injected at runtime
 
 // --- Supabase Configuration (Reverted for Preview Compatibility) ---
 const SUPABASE_PROJECT_URL = import.meta.env.VITE_SUPABASE_URL;
@@ -12,6 +12,17 @@ const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
 const supabaseUrl = typeof __supabase_url !== 'undefined' ? __supabase_url : SUPABASE_PROJECT_URL;
 const supabaseAnonKey = typeof __supabase_anon_key !== 'undefined' ? __supabase_anon_key : SUPABASE_ANON_KEY;
 const HISTORY_TABLE = 'user_history';
+const LOCAL_STORAGE_KEY = 'viovio_store';
+
+// Debounce hook implementation
+const useDebounce = (value, delay) => {
+    const [debouncedValue, setDebouncedValue] = useState(value);
+    useEffect(() => {
+      const handler = setTimeout(() => { setDebouncedValue(value); }, delay);
+      return () => { clearTimeout(handler); };
+    }, [value, delay]);
+    return debouncedValue;
+  };
 
 // --- 1. Local Selection Dictionary (Mock Data) ---
 const MOCK_DICTIONARY = [
@@ -34,6 +45,16 @@ const MOCK_DICTIONARY = [
     example: "I really like this vibe, it makes me feel happy.",
     exampleCn: "我真的很喜欢这种氛围，它让我感到快乐。",
     tags: ["氛围", "流行"]
+  },
+    {
+    word: "Cute",
+    phonetic: "/kjuːt/",
+    meaning: "可爱的；漂亮的",
+    type: "adjective",
+    explanation: "指小巧、精致，或看起来惹人喜爱的特质。",
+    example: "That puppy is so cute!",
+    exampleCn: "那只小狗太可爱了！",
+    tags: ["日常", "形容词"]
   }
 ];
 
@@ -240,61 +261,143 @@ export default function VisualVocabApp() {
   const [showAuthModal, setShowAuthModal] = useState(false);
   const [isLoginMode, setIsLoginMode] = useState(true); 
   const [showDisplayNameModal, setShowDisplayNameModal] = useState(false);
+  const [isMerging, setIsMerging] = useState(false);
 
   const [history, setHistory] = useState([]);
   const inputRef = useRef(null);
   
-  // Load Supabase via CDN for Preview Compatibility
+  // Debounce hook
+  const debouncedQuery = useDebounce(query, 500);
+
+  // Helper: Load Local History
+  const loadLocalHistory = () => {
+    try {
+      const localData = localStorage.getItem(LOCAL_STORAGE_KEY);
+      const data = localData ? JSON.parse(localData) : [];
+      // 确保按时间倒序排列 (最新的在前)
+      return data.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    } catch (e) {
+      console.error("Failed to load local history", e);
+      return [];
+    }
+  };
+  
+  // Load Supabase
   useEffect(() => {
     const loadSupabase = async () => {
-      if (window.supabase) { initSupabaseClient(); return; }
+      // CDN 加载 Supabase 库
       const script = document.createElement('script');
       script.src = "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2";
       script.async = true;
-      script.onload = () => initSupabaseClient();
+      script.onload = () => {
+          if (window.supabase && window.supabase.createClient) {
+              initSupabaseClient(window.supabase.createClient);
+          } else {
+              console.error("Supabase CDN failed to load.");
+              setIsAuthReady(true);
+          }
+      };
       document.body.appendChild(script);
     };
 
-    const initSupabaseClient = () => {
+    const initSupabaseClient = (createClientFn) => {
         try {
-            const { createClient } = window.supabase;
-            const client = createClient(supabaseUrl, supabaseAnonKey);
+            if (!supabaseUrl || !supabaseAnonKey) {
+                console.warn("Supabase keys missing. Running in local-only mode.");
+                setIsAuthReady(true); 
+                return;
+            }
+            const client = createClientFn(supabaseUrl, supabaseAnonKey);
             setSupabase(client);
-            client.auth.onAuthStateChange((event, session) => {
+            
+            client.auth.onAuthStateChange(async (event, session) => {
                 const currentUser = session?.user ?? null;
                 setUser(currentUser);
                 setIsAuthReady(true);
-                if (event === 'SIGNED_IN' && currentUser && !currentUser.user_metadata?.display_name) setShowDisplayNameModal(true);
+                
+                // --- 核心逻辑：登录后合并本地数据 ---
+                if (event === 'SIGNED_IN' && currentUser) {
+                   await mergeLocalHistoryToCloud(client, currentUser.id);
+                   // 检查是否需要设置昵称
+                   if (!currentUser.user_metadata?.display_name) setShowDisplayNameModal(true);
+                }
             });
+            
             client.auth.getSession().then(({ data: { session } }) => {
                 setUser(session?.user ?? null);
                 setIsAuthReady(true);
             });
         } catch (e) { console.error("Supabase init error:", e); setIsAuthReady(true); }
     };
+    
+    // 合并本地数据到云端
+    const mergeLocalHistoryToCloud = async (client, userId) => {
+        const localHistory = loadLocalHistory();
+        if (localHistory.length === 0) return;
+
+        setIsMerging(true);
+        console.log(`Found ${localHistory.length} local items. Merging to cloud...`);
+        
+        const documents = localHistory.map(item => {
+            const { id, ...itemData } = item;
+            return {
+                ...itemData,
+                user_id: userId,
+                timestamp: item.timestamp || new Date().toISOString()
+            };
+        });
+        
+        // 尝试批量上传
+        // 使用 upsert 避免重复
+        const { error } = await client.from(HISTORY_TABLE).upsert(documents, { onConflict: 'word,user_id' });
+        
+        if (!error) {
+            localStorage.removeItem(LOCAL_STORAGE_KEY);
+            console.log("Merge complete. Local storage cleared.");
+        } else {
+            console.error("Batch merge failed:", error);
+            // 如果合并失败，不清空本地数据，让用户可以手动处理或重试
+        }
+
+        setIsMerging(false);
+    };
+
     loadSupabase();
     if (window.innerWidth > 768) inputRef.current?.focus();
   }, []);
 
-  // Fetch History
+  // Fetch History (支持 Local + Remote)
   const fetchHistory = useCallback(async () => {
-      if (!supabase || !user) return;
-      const { data, error } = await supabase
-          .from(HISTORY_TABLE)
-          .select('*')
-          .eq('user_id', user.id)
-          .order('created_at', { ascending: false });
-      if (!error && data) {
-        setHistory(data);
-        if (data.length > 0 && !result) { 
-            const randomItem = data[Math.floor(Math.random() * data.length)];
-            setRandomReviewWord(randomItem);
+      // 场景 A: 用户已登录 -> 查 Supabase
+      if (supabase && user) {
+        const { data, error } = await supabase
+            .from(HISTORY_TABLE)
+            .select('*')
+            .eq('user_id', user.id)
+            .order('timestamp', { ascending: false });
+
+        if (!error && data) {
+            setHistory(data);
+            if (data.length > 0 && !result) { 
+                const randomItem = data[Math.floor(Math.random() * data.length)];
+                setRandomReviewWord(randomItem);
+            }
         }
+      } 
+      // 场景 B: 用户未登录 -> 查 LocalStorage
+      else {
+          const localData = loadLocalHistory();
+          setHistory(localData);
+          if (localData.length > 0 && !result) {
+             const randomItem = localData[Math.floor(Math.random() * localData.length)];
+             setRandomReviewWord(randomItem);
+          }
       }
   }, [supabase, user, result]);
 
+  // 监听 user 变化自动拉取数据
   useEffect(() => {
-      if (supabase && user) fetchHistory(); else setHistory([]);
+      fetchHistory();
   }, [supabase, user, fetchHistory]);
   
   // Actions
@@ -313,46 +416,68 @@ export default function VisualVocabApp() {
     }
   };
 
+  // 核心：保存逻辑 (支持双模)
   const saveToHistory = async (item) => {
-    if (!supabase || !user) return; 
-    const { word, meaning, type, explanation, example, exampleCn, tags, phonetic, audioUrl, imageUrl, isAi } = item;
-    const existingItem = history.find(h => h.word.toLowerCase() === word.toLowerCase());
+    const { word, meaning, type, explanation, example, exampleCn, tags, phonetic, audioUrl, isAi } = item;
     
-    const docData = { 
-      user_id: user.id, 
+    // 通用数据结构
+    const baseData = { 
       word, meaning, type, explanation, example, exampleCn, tags, phonetic, 
-      audioUrl: audioUrl || null,
-      imageUrl: imageUrl || null,
-      isAi: isAi || false,
+      audioUrl: audioUrl || null, 
+      imageUrl: item.imageUrl || null, 
+      isAi: isAi || false, 
       timestamp: new Date().toISOString() 
     };
 
-    try {
-        if (existingItem?.id) {
-            await supabase.from(HISTORY_TABLE).update(docData).eq('id', existingItem.id);
-        } else {
-            await supabase.from(HISTORY_TABLE).insert(docData);
-        }
-        fetchHistory();
-    } catch(e) { 
-        console.warn("Full save failed, retrying minimal save...", e);
-        const minimalData = { ...docData };
-        delete minimalData.audioUrl; delete minimalData.imageUrl; delete minimalData.isAi;
+    // A. 已登录 -> 存云端
+    if (supabase && user) {
+        const existingItem = history.find(h => h.word.toLowerCase() === word.toLowerCase());
+        const docData = { ...baseData, user_id: user.id };
+        
         try {
-             if (existingItem?.id) await supabase.from(HISTORY_TABLE).update(minimalData).eq('id', existingItem.id);
-             else await supabase.from(HISTORY_TABLE).insert(minimalData);
-             fetchHistory();
-        } catch (retryErr) { console.error("Retry save failed:", retryErr); }
+            if (existingItem?.id) {
+                // 如果存在，则更新
+                await supabase.from(HISTORY_TABLE)
+                    .update(docData)
+                    .eq('id', existingItem.id);
+            } else {
+                // 否则插入
+                await supabase.from(HISTORY_TABLE).insert(docData);
+            }
+        } catch(e) { 
+             console.error("Supabase Save Error:", e);
+        }
+    } 
+    // B. 未登录 -> 存本地
+    else {
+        const localData = loadLocalHistory();
+        const filtered = localData.filter(h => h.word.toLowerCase() !== word.toLowerCase());
+        const newLocalItem = { ...baseData, id: Date.now() };
+        const newHistory = [newLocalItem, ...filtered];
+        
+        try {
+            localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(newHistory));
+        } catch (e) {
+            console.error("Local storage full?", e);
+        }
     }
+    
+    fetchHistory();
   };
 
   const deleteHistoryItem = async (id) => {
       if (supabase && user) {
         await supabase.from(HISTORY_TABLE).delete().eq('id', id);
-        fetchHistory(); 
+      } else {
+          // 本地删除
+          const localData = loadLocalHistory();
+          const newData = localData.filter(item => item.id !== id);
+          localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(newData));
       }
+      fetchHistory(); 
   };
   
+  // AI Search Logic
   const fetchGeminiData = async (word) => {
     const prompt = `Vocabulary tutor backend. Word: "${word}". Return JSON (NO markdown): { "word": "Corrected", "meaning": "Concise Chinese", "explanation": "Fun Chinese expl (max 60 chars)", "example": "English sentence", "exampleCn": "Chinese translation", "type": "Part of speech", "tags": ["Tag1"] }`;
     try {
@@ -366,25 +491,26 @@ export default function VisualVocabApp() {
     } catch (err) { return null; }
   };
 
-  const handleSearch = async (e) => {
-    e?.preventDefault();
-    if (!query.trim()) return;
+  const executeSearch = useCallback(async (searchQuery) => {
     setLoading(true); setAiThinking(false); setResult(null); setError(null);
     setRandomReviewWord(null); 
     if (window.innerWidth < 1024) setActiveTab('search');
     
-    const cleanQuery = query.trim();
+    const cleanQuery = searchQuery.trim();
     const lowerQuery = cleanQuery.toLowerCase();
+    
+    // 1. 尝试本地 MOCK 匹配 (即时返回)
     const localMatch = MOCK_DICTIONARY.find(item => item.word.toLowerCase() === lowerQuery);
     
     if (localMatch) {
-      setTimeout(() => {
+      setTimeout(() => { // 模拟轻微处理时间，提升主观流畅度
         const finalResult = { ...localMatch, searchedAt: Date.now(), isAi: false, audioUrl: null, phonetic: localMatch.phonetic || '/.../' };
         setResult(finalResult); saveToHistory(finalResult); setLoading(false);
-      }, 300);
+      }, 50);
       return;
     }
 
+    // 2. 网络搜索流程
     setAiThinking(true);
     try {
       const [dictResponse, aiData] = await Promise.allSettled([
@@ -395,7 +521,8 @@ export default function VisualVocabApp() {
       if (aiData.status === 'fulfilled' && aiData.value) {
         const aiInfo = aiData.value;
         let audioUrl = "", phonetic = "";
-        if (dictResponse.status === 'fulfilled' && Array.isArray(dictResponse.value) && dictResponse.value.length > 0) {
+        
+        if (Array.isArray(dictResponse.value) && dictResponse.value.length > 0) { // 修复后的 Array.isArray
           phonetic = dictResponse.value[0].phonetics?.find(p => p.text)?.text || "";
           audioUrl = dictResponse.value[0].phonetics?.find(p => p.audio)?.audio || "";
         }
@@ -411,7 +538,25 @@ export default function VisualVocabApp() {
       } else { throw new Error("Service unavailable"); }
     } catch (err) { setError(`无法解析 "${cleanQuery}"。`); } 
     finally { setLoading(false); setAiThinking(false); }
+  }, [saveToHistory]);
+  
+  
+  // 触发搜索的副作用
+  useEffect(() => {
+    if (debouncedQuery.trim() && debouncedQuery.trim() !== result?.word) {
+      executeSearch(debouncedQuery);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debouncedQuery]);
+
+
+  const handleSearch = (e) => {
+    e?.preventDefault();
+    if (query.trim() && query.trim() !== result?.word) {
+        executeSearch(query);
+    }
   };
+
 
   const playAudio = (text, e, url) => {
     e?.stopPropagation();
@@ -440,6 +585,8 @@ export default function VisualVocabApp() {
       }
   };
 
+  const showSyncStatus = user && isMerging;
+
   return (
     <div className="min-h-screen bg-[#fff9e6] font-sans text-slate-700 flex flex-col">
       <AuthModal show={showAuthModal} onClose={() => setShowAuthModal(false)} isLoginMode={isLoginMode} setIsLoginMode={setIsLoginMode} handleAuthAction={handleAuthAction} />
@@ -449,7 +596,6 @@ export default function VisualVocabApp() {
       <header className="bg-[#fff9e6]/95 backdrop-blur-sm sticky top-0 z-20 border-b border-slate-100/50 lg:border-none px-4 py-3">
         <div className="max-w-6xl mx-auto flex justify-between items-center">
           <div className="flex items-center gap-2 cursor-pointer hover:opacity-80 transition-opacity" onClick={() => {setResult(null); setQuery(''); fetchHistory();}}>
-            {/* 3. Logo 换成 Cat */}
             <div className="bg-lime-500 p-1.5 rounded-lg border-b-4 border-lime-700 shadow-sm text-white"><Cat className="w-5 h-5 fill-current" /></div>
             <div className="flex flex-col leading-tight">
                 <span className="text-xl font-extrabold text-slate-700 tracking-tight">VioVio</span>
@@ -461,7 +607,10 @@ export default function VisualVocabApp() {
                   <><div className="hidden lg:flex items-center gap-2 bg-white px-3 py-1.5 rounded-xl border-2 border-slate-100 font-bold text-slate-400 text-xs"><Monitor className="w-3 h-3" /><span className="truncate max-w-[80px]">{user.user_metadata?.display_name || user.email?.split('@')[0]}</span></div><GameButton onClick={handleSignOut} variant="secondary" className="!py-1.5 !px-3 !text-xs font-bold">Exit</GameButton></>
                 ) : (<GameButton onClick={() => { setIsLoginMode(true); setShowAuthModal(true); }} variant="yellow" className="!py-1.5 !px-3 !text-xs font-bold"><LogIn className="w-3 h-3 fill-yellow-900" /> Login</GameButton>)
              ) : (<Loader2 className="w-5 h-5 animate-spin text-slate-400" />)}
-             <div className="flex items-center gap-1 bg-white px-3 py-1.5 rounded-full border-2 border-slate-100 font-bold text-yellow-500 text-xs shadow-sm"><Zap className="w-3 h-3 fill-current" /><span>{history.length}</span></div>
+             <div className="flex items-center gap-1 bg-white px-3 py-1.5 rounded-full border-2 border-slate-100 font-bold text-yellow-500 text-xs shadow-sm">
+                {showSyncStatus ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Zap className="w-3 h-3 fill-current" />}
+                <span>{history.length}</span>
+             </div>
           </div>
         </div>
       </header>

@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Search, Book, Volume2, X, Trash2, Star, Zap, AlertCircle, Monitor, Loader2, LogIn, Mail, Lock, User, SkipForward, RefreshCw, Type, Shuffle, Sparkles, Eye, EyeOff, Cat, CheckCircle } from 'lucide-react';
 
 // --- Global Configuration ---
-const apiKey = ""; // API key is automatically injected at runtime
+const apiKey = import.meta.env.VITE_GEMINI_API_KEY; // API key is automatically injected at runtime
 
 // --- Supabase Configuration (Reverted for Preview Compatibility) ---
 const SUPABASE_PROJECT_URL = import.meta.env.VITE_SUPABASE_URL;

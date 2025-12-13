@@ -309,7 +309,12 @@ useEffect(() => {
               setIsAuthReady(true); 
               return;
           }
-          const client = createClientFn(supabaseUrl, supabaseAnonKey);
+          const client = createClientFn(supabaseUrl, supabaseAnonKey, {
+  auth: {
+    persistSession: true,
+    storage: window.localStorage
+  }
+});
           setSupabase(client);
           
           client.auth.onAuthStateChange(async (event, session) => {
@@ -319,6 +324,12 @@ useEffect(() => {
               
               // --- 核心逻辑：登录后合并本地数据 ---
               if (event === 'SIGNED_IN' && currentUser) {
+                 // 清除错误信息和查询状态，回到首页
+                 setError(null);
+                 setResult(null);
+                 setQuery('');
+                 setShowAuthModal(false);
+                 
                  // 确保在合并前，用户已经被设置
                  if(supabase) await mergeLocalHistoryToCloud(client, currentUser.id);
                  // 检查是否需要设置昵称
@@ -382,7 +393,8 @@ const fetchHistory = useCallback(async () => {
 
       if (!error && data) {
           setHistory(data);
-          if (data.length > 0 && !result) { 
+          // 只在没有随机单词且没有查询结果时才设置新的随机单词
+          if (data.length > 0 && !result && !randomReviewWord) { 
               const randomItem = data[Math.floor(Math.random() * data.length)];
               setRandomReviewWord(randomItem);
           }
@@ -392,12 +404,13 @@ const fetchHistory = useCallback(async () => {
     else {
         const localData = loadLocalHistory();
         setHistory(localData);
-        if (localData.length > 0 && !result) {
+        // 只在没有随机单词且没有查询结果时才设置新的随机单词
+        if (localData.length > 0 && !result && !randomReviewWord) {
            const randomItem = localData[Math.floor(Math.random() * localData.length)];
            setRandomReviewWord(randomItem);
         }
     }
-}, [supabase, user, result]);
+}, [supabase, user, result, randomReviewWord]);
 
 // 监听 user 变化自动拉取数据
 useEffect(() => {
@@ -481,9 +494,84 @@ const deleteHistoryItem = async (id) => {
     fetchHistory(); 
 };
 
+// Helper function to remove leading/trailing quotes
+const removeQuotes = (str) => {
+  if (!str || typeof str !== 'string') return str;
+  return str.replace(/^["']|["']$/g, '').trim();
+};
+
+// Helper function to check if phonetic is valid
+const isValidPhonetic = (phonetic) => {
+  if (!phonetic) return false;
+  const trimmed = phonetic.trim();
+  return trimmed && trimmed !== "/.../" && trimmed !== '/.../' && trimmed.length > 0;
+};
+
+// Helper function to detect if text contains Chinese characters
+const isChinese = (text) => {
+  return /[\u4e00-\u9fa5]/.test(text);
+};
+
+// Translate Chinese to English with retry
+const translateChineseToEnglish = async (chineseText, retries = 2) => {
+  const prompt = `Translate the following Chinese word/phrase to English. Return only the English translation, no explanation, no quotes, no markdown. If it's a phrase, keep it as a phrase. Chinese: "${chineseText}"`;
+  
+  for (let i = 0; i <= retries; i++) {
+    try {
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+      });
+      
+      if (!response.ok) {
+        if (i === retries) {
+          const errorData = await response.json().catch(() => ({}));
+          console.error('Translation API Error:', response.status, errorData);
+          return null;
+        }
+        // 等待后重试
+        await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+        continue;
+      }
+      
+      const data = await response.json();
+      
+      if (!data.candidates || !data.candidates[0] || !data.candidates[0].content || !data.candidates[0].content.parts || !data.candidates[0].content.parts[0]) {
+        if (i === retries) {
+          console.error('Translation API returned invalid structure:', data);
+          return null;
+        }
+        await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+        continue;
+      }
+      
+      const translatedText = data.candidates[0].content.parts[0].text?.trim();
+      
+      if (!translatedText || translatedText.length === 0) {
+        if (i === retries) {
+          console.error('Translation result is empty');
+          return null;
+        }
+        await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+        continue;
+      }
+      
+      const cleaned = removeQuotes(translatedText);
+      return cleaned || null;
+    } catch (err) { 
+      if (i === retries) {
+        console.error('Translation error:', err);
+        return null;
+      }
+      await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+    }
+  }
+  return null;
+};
+
 // AI Search Logic
 const fetchGeminiData = async (word) => {
-  const prompt = `Vocabulary tutor backend. Word: "${word}". Return JSON (NO markdown): { "word": "Corrected", "meaning": "Concise Chinese", "explanation": "Fun Chinese expl (max 60 chars)", "example": "English sentence", "exampleCn": "Chinese translation", "type": "Part of speech", "tags": ["Tag1"] }`;
+  const prompt = `Vocabulary tutor backend. Word: "${word}". Return JSON (NO markdown): { "word": "Corrected", "meaning": "Concise Chinese", "explanation": "Fun Chinese expl (max 60 chars)", "example": "English sentence without quotes", "exampleCn": "Chinese translation", "type": "Part of speech", "tags": ["Tag1"] }`;
   try {
     const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -496,60 +584,111 @@ const fetchGeminiData = async (word) => {
 };
 
 const executeSearch = useCallback(async (searchQuery) => {
+  // 检查登录状态
+  if (!user || !isAuthReady) {
+    setError('请先登录后再使用单词查询功能。');
+    setShowAuthModal(true);
+    setIsLoginMode(true);
+    return;
+  }
+  
   setLoading(true); setAiThinking(false); setResult(null); setError(null);
   setRandomReviewWord(null); 
   if (window.innerWidth < 1024) setActiveTab('search');
   
   const cleanQuery = searchQuery.trim();
-  const lowerQuery = cleanQuery.toLowerCase();
+  
+  // 0. 检测是否为中文输入，如果是则先翻译成英文
+  let englishQuery = cleanQuery;
+  const originalQuery = cleanQuery;
+  
+  if (isChinese(cleanQuery)) {
+    setAiThinking(true);
+    const translated = await translateChineseToEnglish(cleanQuery);
+    if (!translated) {
+      setError(`无法翻译 "${cleanQuery}"，请检查网络连接或稍后重试。`);
+      setLoading(false);
+      setAiThinking(false);
+      return;
+    }
+    englishQuery = translated;
+  }
+  
+  const lowerQuery = englishQuery.toLowerCase();
   
   // 1. 尝试本地 MOCK 匹配 (即时返回)
   const localMatch = MOCK_DICTIONARY.find(item => item.word.toLowerCase() === lowerQuery);
   
   if (localMatch) {
     setTimeout(() => { // 模拟轻微处理时间，提升主观流畅度
-      const finalResult = { ...localMatch, searchedAt: Date.now(), isAi: false, audioUrl: null, phonetic: localMatch.phonetic || '/.../' };
+      const finalResult = { ...localMatch, searchedAt: Date.now(), isAi: false, audioUrl: null, phonetic: localMatch.phonetic || null };
       setResult(finalResult); saveToHistory(finalResult); setLoading(false);
     }, 50);
     return;
   }
 
-  // 2. 网络搜索流程
+  // 2. 网络搜索流程（使用翻译后的英文查询）
   setAiThinking(true);
   try {
     const [dictResponse, aiData] = await Promise.allSettled([
-      fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${lowerQuery}`).then(res => res.json()),
-      fetchGeminiData(cleanQuery)
+      fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(lowerQuery)}`).then(res => res.json()),
+      fetchGeminiData(englishQuery)
     ]);
 
     if (aiData.status === 'fulfilled' && aiData.value) {
       const aiInfo = aiData.value;
-      let audioUrl = "", phonetic = "";
+      let audioUrl = "", phonetic = null;
       
       if (Array.isArray(dictResponse.value) && dictResponse.value.length > 0) { // 修复后的 Array.isArray
-        phonetic = dictResponse.value[0].phonetics?.find(p => p.text)?.text || "";
+        const foundPhonetic = dictResponse.value[0].phonetics?.find(p => p.text && p.text.trim());
+        phonetic = foundPhonetic?.text?.trim() || null;
         audioUrl = dictResponse.value[0].phonetics?.find(p => p.audio)?.audio || "";
       }
       
+      // 修复：如果是短语（包含空格），优先使用原始查询；如果是单词，可以使用 AI 返回的修正版本
+      const isPhrase = englishQuery.includes(' ');
+      const finalWord = isPhrase ? englishQuery : (aiInfo.word || englishQuery);
+      
       const finalResult = {
-        word: aiInfo.word || cleanQuery, phonetic: phonetic || "/.../", audioUrl, 
+        word: finalWord, phonetic: phonetic, audioUrl, 
         meaning: aiInfo.meaning, type: aiInfo.type, explanation: aiInfo.explanation, 
-        example: aiInfo.example, exampleCn: aiInfo.exampleCn, tags: aiInfo.tags || ["AI"],
+        example: removeQuotes(aiInfo.example), exampleCn: removeQuotes(aiInfo.exampleCn), tags: aiInfo.tags || ["AI"],
         isAi: true
       };
       setResult(finalResult); 
       await saveToHistory(finalResult); 
     } else { throw new Error("Service unavailable"); }
-  } catch (err) { setError(`无法解析 "${cleanQuery}"。`); } 
+  } catch (err) { setError(`无法解析 "${englishQuery}"。`); } 
   finally { setLoading(false); setAiThinking(false); }
-}, [saveToHistory]);
+}, [saveToHistory, user, isAuthReady]);
 
 
 // ** REMOVED: useEffect for debouncedQuery is no longer needed **
 
+// 监听用户登录状态，登录成功后清除错误并重置状态
+useEffect(() => {
+  if (user && isAuthReady) {
+    // 用户已登录，清除之前的登录提示错误信息
+    if (error && error.includes('请先登录')) {
+      setError(null);
+      setResult(null);
+      setQuery('');
+    }
+  }
+}, [user, isAuthReady, error]);
+
 
 const handleSearch = (e) => {
   e?.preventDefault();
+  
+  // 检查登录状态
+  if (!user || !isAuthReady) {
+    setError('请先登录后再使用单词查询功能。');
+    setShowAuthModal(true);
+    setIsLoginMode(true);
+    return;
+  }
+  
   if (query.trim() && query.trim() !== result?.word) {
       executeSearch(query); // <-- 只在点击 GO 或回车时调用
   }
@@ -587,13 +726,33 @@ const showSyncStatus = user && isMerging;
 
 return (
   <div className="min-h-screen bg-[#fff9e6] font-sans text-slate-700 flex flex-col">
-    <AuthModal show={showAuthModal} onClose={() => setShowAuthModal(false)} isLoginMode={isLoginMode} setIsLoginMode={setIsLoginMode} handleAuthAction={handleAuthAction} />
+    <AuthModal 
+      show={showAuthModal} 
+      onClose={() => {
+        setShowAuthModal(false);
+        // 如果用户已登录，清除错误信息并重置状态
+        if (user) {
+          setError(null);
+          setResult(null);
+          setQuery('');
+        }
+      }} 
+      isLoginMode={isLoginMode} 
+      setIsLoginMode={setIsLoginMode} 
+      handleAuthAction={handleAuthAction} 
+    />
     <DisplayNameModal show={showDisplayNameModal} onClose={() => setShowDisplayNameModal(false)} onSave={handleUpdateDisplayName} />
     
     {/* Header */}
     <header className="bg-[#fff9e6]/95 backdrop-blur-sm sticky top-0 z-20 border-b border-slate-100/50 lg:border-none px-4 py-3">
       <div className="max-w-6xl mx-auto flex justify-between items-center">
-        <div className="flex items-center gap-2 cursor-pointer hover:opacity-80 transition-opacity" onClick={() => {setResult(null); setQuery(''); fetchHistory();}}>
+        <div className="flex items-center gap-2 cursor-pointer hover:opacity-80 transition-opacity" onClick={() => {
+          setResult(null); 
+          setQuery(''); 
+          setError(null);
+          setRandomReviewWord(null);
+          fetchHistory();
+        }}>
           <div className="bg-lime-500 p-1.5 rounded-lg border-b-4 border-lime-700 shadow-sm text-white"><Cat className="w-5 h-5 fill-current" /></div>
           <div className="flex flex-col leading-tight">
               <span className="text-xl font-extrabold text-slate-700 tracking-tight">VioVio</span>
@@ -620,7 +779,7 @@ return (
           <Search className="w-6 h-6 text-slate-400 shrink-0" />
           <form onSubmit={handleSearch} className="flex-1"><input ref={inputRef} type="text" value={query} onChange={(e) => { setQuery(e.target.value); setError(null); }} placeholder="Type a word..." className="w-full bg-transparent py-4 text-xl font-bold text-slate-700 placeholder:text-slate-300 placeholder:font-medium focus:outline-none" /></form>
           {query && <button type="button" onClick={() => { setQuery(''); setError(null); setResult(null); setRandomReviewWord(null); fetchHistory(); inputRef.current?.focus(); }} className="p-2 rounded-full text-slate-300 hover:bg-slate-100 hover:text-slate-500 transition-colors mr-2"><X className="w-5 h-5" /></button>}
-          <GameButton type="submit" onClick={handleSearch} variant="primary" className="mr-2 !py-2.5 !px-6 text-base" disabled={loading || !query || !isAuthReady}>GO</GameButton>
+          <GameButton type="submit" onClick={handleSearch} variant="primary" className="mr-2 !py-2.5 !px-6 text-base" disabled={loading || !query || !isAuthReady || !user}>GO</GameButton>
         </div>
         
         {error && <div className="bg-rose-50 border-2 border-rose-100 rounded-2xl p-8 text-center animate-in zoom-in-95"><p className="text-rose-600 font-bold">{error}</p></div>}
@@ -688,7 +847,7 @@ return (
                    <div className="bg-sky-50 p-4 rounded-2xl border border-sky-100 text-slate-600 leading-relaxed text-sm">{result.explanation}</div>
                 </div>
 
-                <div className="bg-lime-50 p-5 rounded-2xl border border-lime-100 hover:border-lime-200 transition-colors group cursor-pointer" onClick={() => speakText(result.example)}><div className="flex items-start gap-3"><div className="mt-1 p-1.5 bg-white rounded-full text-lime-600 shadow-sm"><Volume2 className="w-3 h-3" /></div><div><p className="text-lg font-bold text-slate-700 leading-snug group-hover:text-lime-700 transition-colors">"{result.example}"</p><p className="text-slate-500 text-sm mt-1 font-medium">{result.exampleCn}</p></div></div></div>
+                <div className="bg-lime-50 p-5 rounded-2xl border border-lime-100 hover:border-lime-200 transition-colors group cursor-pointer" onClick={() => speakText(result.example)}><div className="flex items-start gap-3"><div className="mt-1 p-1.5 bg-white rounded-full text-lime-600 shadow-sm"><Volume2 className="w-3 h-3" /></div><div><p className="text-lg font-bold text-slate-700 leading-snug group-hover:text-lime-700 transition-colors">{result.example}</p><p className="text-slate-500 text-sm mt-1 font-medium">{result.exampleCn}</p></div></div></div>
                 {result.tags && <div className="mt-6 flex gap-2 flex-wrap">{result.tags.map(tag => <span key={tag} className="px-2.5 py-1 bg-slate-100 text-slate-400 rounded-md text-[10px] font-bold uppercase tracking-wider">#{tag}</span>)}</div>}
               </div>
             </div>

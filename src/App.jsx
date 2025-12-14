@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Search, Book, Volume2, X, Trash2, Star, Zap, AlertCircle, Monitor, Loader2, LogIn, Mail, Lock, User, SkipForward, RefreshCw, Type, Shuffle, Sparkles, Eye, EyeOff, Cat, CheckCircle } from 'lucide-react';
 
 // --- Global Configuration ---
-const apiKey = import.meta.env.VITE_GEMINI_API_KEY; // API key is automatically injected at runtime
+const apiKey = import.meta.env.VITE_DEEPSEEK_API_KEY; // API key is automatically injected at runtime
 
 // --- Supabase Configuration (Reverted for Preview Compatibility) ---
 const SUPABASE_PROJECT_URL = import.meta.env.VITE_SUPABASE_URL;
@@ -518,9 +518,19 @@ const translateChineseToEnglish = async (chineseText, retries = 2) => {
   
   for (let i = 0; i <= retries; i++) {
     try {
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+      const response = await fetch('https://api.deepseek.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`
+        },
+        body: JSON.stringify({
+          model: 'deepseek-chat',
+          messages: [
+            { role: 'user', content: prompt }
+          ],
+          temperature: 0.3
+        })
       });
       
       if (!response.ok) {
@@ -536,7 +546,7 @@ const translateChineseToEnglish = async (chineseText, retries = 2) => {
       
       const data = await response.json();
       
-      if (!data.candidates || !data.candidates[0] || !data.candidates[0].content || !data.candidates[0].content.parts || !data.candidates[0].content.parts[0]) {
+      if (!data.choices || !data.choices[0] || !data.choices[0].message || !data.choices[0].message.content) {
         if (i === retries) {
           console.error('Translation API returned invalid structure:', data);
           return null;
@@ -545,7 +555,7 @@ const translateChineseToEnglish = async (chineseText, retries = 2) => {
         continue;
       }
       
-      const translatedText = data.candidates[0].content.parts[0].text?.trim();
+      const translatedText = data.choices[0].message.content.trim();
       
       if (!translatedText || translatedText.length === 0) {
         if (i === retries) {
@@ -569,18 +579,61 @@ const translateChineseToEnglish = async (chineseText, retries = 2) => {
   return null;
 };
 
-// AI Search Logic
-const fetchGeminiData = async (word) => {
+// AI Search Logic (using DeepSeek)
+const fetchDeepSeekData = async (word) => {
   const prompt = `Vocabulary tutor backend. Word: "${word}". Return JSON (NO markdown): { "word": "Corrected", "meaning": "Concise Chinese", "explanation": "Fun Chinese expl (max 60 chars)", "example": "English sentence without quotes", "exampleCn": "Chinese translation", "type": "Part of speech", "tags": ["Tag1"] }`;
   try {
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: "application/json" } })
+    const response = await fetch('https://api.deepseek.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model: 'deepseek-chat',
+        messages: [
+          { role: 'user', content: prompt }
+        ],
+        temperature: 0.3,
+        response_format: { type: 'json_object' }
+      })
     });
-    if (!response.ok) throw new Error('API Error');
+    
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      console.error('DeepSeek API Error:', response.status, errorData);
+      return null;
+    }
+    
     const data = await response.json();
-    return JSON.parse(data.candidates[0].content.parts[0].text);
-  } catch (err) { return null; }
+    
+    if (!data.choices || !data.choices[0] || !data.choices[0].message || !data.choices[0].message.content) {
+      console.error('DeepSeek API returned invalid structure:', data);
+      return null;
+    }
+    
+    const responseText = data.choices[0].message.content.trim();
+    
+    if (!responseText || responseText.length === 0) {
+      console.error('DeepSeek API returned empty response');
+      return null;
+    }
+    
+    try {
+      const parsed = JSON.parse(responseText);
+      if (!parsed.meaning || !parsed.explanation) {
+        console.error('DeepSeek API returned incomplete data:', parsed);
+        return null;
+      }
+      return parsed;
+    } catch (parseError) {
+      console.error('Failed to parse DeepSeek API response:', parseError, 'Response:', responseText);
+      return null;
+    }
+  } catch (err) { 
+    console.error('DeepSeek API request error:', err);
+    return null; 
+  }
 };
 
 const executeSearch = useCallback(async (searchQuery) => {
@@ -632,20 +685,19 @@ const executeSearch = useCallback(async (searchQuery) => {
   try {
     const [dictResponse, aiData] = await Promise.allSettled([
       fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(lowerQuery)}`).then(res => res.json()),
-      fetchGeminiData(englishQuery)
+      fetchDeepSeekData(englishQuery)
     ]);
 
     if (aiData.status === 'fulfilled' && aiData.value) {
       const aiInfo = aiData.value;
       let audioUrl = "", phonetic = null;
       
-      if (Array.isArray(dictResponse.value) && dictResponse.value.length > 0) { // 修复后的 Array.isArray
+      if (Array.isArray(dictResponse.value) && dictResponse.value.length > 0) {
         const foundPhonetic = dictResponse.value[0].phonetics?.find(p => p.text && p.text.trim());
         phonetic = foundPhonetic?.text?.trim() || null;
         audioUrl = dictResponse.value[0].phonetics?.find(p => p.audio)?.audio || "";
       }
       
-      // 修复：如果是短语（包含空格），优先使用原始查询；如果是单词，可以使用 AI 返回的修正版本
       const isPhrase = englishQuery.includes(' ');
       const finalWord = isPhrase ? englishQuery : (aiInfo.word || englishQuery);
       
@@ -657,8 +709,17 @@ const executeSearch = useCallback(async (searchQuery) => {
       };
       setResult(finalResult); 
       await saveToHistory(finalResult); 
-    } else { throw new Error("Service unavailable"); }
-  } catch (err) { setError(`无法解析 "${englishQuery}"。`); } 
+    } else { 
+      const errorMsg = aiData.status === 'rejected' 
+        ? `无法解析 "${englishQuery}"，API 请求失败。请检查网络连接或稍后重试。`
+        : aiData.value === null
+        ? `无法解析 "${englishQuery}"，API 返回数据无效。请稍后重试。`
+        : `无法解析 "${englishQuery}"，服务暂时不可用。请稍后重试。`;
+      throw new Error(errorMsg);
+    }
+  } catch (err) { 
+    setError(err.message || `无法解析 "${englishQuery}"。`); 
+  } 
   finally { setLoading(false); setAiThinking(false); }
 }, [saveToHistory, user, isAuthReady]);
 
@@ -779,7 +840,7 @@ return (
           <Search className="w-6 h-6 text-slate-400 shrink-0" />
           <form onSubmit={handleSearch} className="flex-1"><input ref={inputRef} type="text" value={query} onChange={(e) => { setQuery(e.target.value); setError(null); }} placeholder="Type a word..." className="w-full bg-transparent py-4 text-xl font-bold text-slate-700 placeholder:text-slate-300 placeholder:font-medium focus:outline-none" /></form>
           {query && <button type="button" onClick={() => { setQuery(''); setError(null); setResult(null); setRandomReviewWord(null); fetchHistory(); inputRef.current?.focus(); }} className="p-2 rounded-full text-slate-300 hover:bg-slate-100 hover:text-slate-500 transition-colors mr-2"><X className="w-5 h-5" /></button>}
-          <GameButton type="submit" onClick={handleSearch} variant="primary" className="mr-2 !py-2.5 !px-6 text-base" disabled={loading || !query || !isAuthReady || !user}>GO</GameButton>
+          <GameButton type="submit" onClick={handleSearch} variant="primary" className="mr-2 !py-2.5 !px-6 text-base" disabled={loading || !query || !isAuthReady}>GO</GameButton>
         </div>
         
         {error && <div className="bg-rose-50 border-2 border-rose-100 rounded-2xl p-8 text-center animate-in zoom-in-95"><p className="text-rose-600 font-bold">{error}</p></div>}
